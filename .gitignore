@@ -1,0 +1,28 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Chalice local/deploy artifacts
+.chalice/deployed/
+.chalice/venv/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# IDE/OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+.chalice/
