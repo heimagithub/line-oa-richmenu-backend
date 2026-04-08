@@ -52,4 +52,10 @@ create_table_if_missing \
   '[{"AttributeName":"oaId","AttributeType":"S"},{"AttributeName":"jobId","AttributeType":"S"},{"AttributeName":"jobStatus","AttributeType":"S"},{"AttributeName":"createdAt","AttributeType":"S"},{"AttributeName":"richMenuIdCreatedAt","AttributeType":"S"}]' \
   '[{"IndexName":"gsi_job_status_created","KeySchema":[{"AttributeName":"jobStatus","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}},{"IndexName":"gsi_oa_richmenu_created","KeySchema":[{"AttributeName":"oaId","KeyType":"HASH"},{"AttributeName":"richMenuIdCreatedAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]'
 
+create_table_if_missing \
+  "line_payment_order" \
+  '[{"AttributeName":"orderId","KeyType":"HASH"}]' \
+  '[{"AttributeName":"orderId","AttributeType":"S"},{"AttributeName":"userId","AttributeType":"S"},{"AttributeName":"createdAt","AttributeType":"S"}]' \
+  '[{"IndexName":"gsi_user_created","KeySchema":[{"AttributeName":"userId","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]'
+
 echo "All DynamoDB tables are ready."

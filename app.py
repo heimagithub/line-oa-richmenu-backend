@@ -1,10 +1,12 @@
 import os
 import uuid
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from botocore.exceptions import ClientError
 from chalice import Chalice, CORSConfig, Response
 from boto3.dynamodb.conditions import Key
 
@@ -23,11 +25,13 @@ from chalicelib.db import (
     list_richmenus,
     now_iso,
     oa_table,
+    payment_order_table,
     publish_job_table,
     richmenu_table,
     users_table,
 )
 from chalicelib.http import error, success
+from chalicelib.linepay import post_linepay_order, verify_payment_callback
 from chalicelib.storage import (
     get_richmenu_image_url,
     upload_oa_avatar_bytes,
@@ -35,6 +39,12 @@ from chalicelib.storage import (
 )
 
 app = Chalice(app_name="line-oa-richmenu-api")
+
+
+def _payment_log(msg: str) -> None:
+    print(f"[payments/orders] {msg}", flush=True)
+
+
 app.debug = True
 app.api.cors = CORSConfig(
     allow_origin=os.environ.get("CORS_ALLOW_ORIGIN", "http://localhost:3001"),
@@ -44,6 +54,8 @@ app.api.cors = CORSConfig(
 
 ACCESS_COOKIE_NAME = "access_token"
 REFRESH_COOKIE_NAME = "refresh_token"
+# 僅此帳號可在登入／refresh 的 JSON 回應中取得 access_token（其餘帳號僅能透過 HttpOnly cookie）
+DEBUG_ACCESS_TOKEN_EMAIL = "heima@gmail.com"
 ACCESS_TOKEN_TTL_SECONDS = 2 * 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
@@ -118,7 +130,11 @@ def _issue_auth_response(user):
     refresh_token = create_refresh_token(
         user["userId"], user.get("role", "editor"), ttl_seconds=REFRESH_TOKEN_TTL_SECONDS
     )
-    body = {"data": _build_auth_payload(user)}
+    auth_payload = _build_auth_payload(user)
+    body = {"data": auth_payload}
+    email_normalized = (user.get("email") or "").strip().lower()
+    if email_normalized == DEBUG_ACCESS_TOKEN_EMAIL:
+        body["data"]["access_token"] = access_token
     set_cookies = [
         _cookie_header(ACCESS_COOKIE_NAME, access_token, ACCESS_TOKEN_TTL_SECONDS),
         _cookie_header(REFRESH_COOKIE_NAME, refresh_token, REFRESH_TOKEN_TTL_SECONDS),
@@ -167,6 +183,35 @@ def _require_auth():
     if not payload:
         raise PermissionError()
     return payload
+
+
+def _normalize_dynamo_numbers(item):
+    if not item:
+        return item
+    out = {}
+    for k, v in item.items():
+        if isinstance(v, Decimal):
+            out[k] = int(v) if v % 1 == 0 else float(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _extract_linepay_order_response(body: dict) -> tuple[str | None, str | None]:
+    if not body:
+        return None, None
+    nested = body.get("data") if isinstance(body.get("data"), dict) else None
+    src = nested or body
+    oid = (
+        src.get("order_id")
+        or src.get("orderId")
+        or src.get("id")
+        or body.get("order_id")
+        or body.get("orderId")
+        or body.get("id")
+    )
+    purl = src.get("payment_url") or src.get("paymentUrl") or body.get("payment_url") or body.get("paymentUrl")
+    return (str(oid).strip() if oid else None, str(purl).strip() if purl else None)
 
 
 def _enrich_richmenu_image(item):
@@ -769,6 +814,33 @@ def publish_richmenu(richmenu_id):
     if not image_url:
         return error("VALIDATION_ERROR", "richmenu image is required", 400)
 
+    raw_test_publish_without_payment = body.get("testPublishWithoutPayment") or body.get("bypassPaymentCheck")
+    if isinstance(raw_test_publish_without_payment, bool):
+        test_publish_without_payment = raw_test_publish_without_payment
+    elif isinstance(raw_test_publish_without_payment, str):
+        normalized = raw_test_publish_without_payment.strip().lower()
+        test_publish_without_payment = normalized in {"true", "1", "yes", "y"}
+    else:
+        test_publish_without_payment = bool(raw_test_publish_without_payment)
+
+    if not test_publish_without_payment:
+        try:
+            validity = _get_payment_validity_for_user(user["sub"])
+        except ClientError as exc:
+            err = exc.response.get("Error") or {}
+            return error(
+                "DATABASE_ERROR",
+                f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}",
+                503,
+            )
+        if not validity.get("isPaid"):
+            return error(
+                "PAYMENT_REQUIRED",
+                "請付費完即可發佈圖文選單",
+                402,
+                details=validity,
+            )
+
     now = now_iso()
     job_id = f"pub_{uuid.uuid4().hex[:12]}"
     raw_set_as_default = body.get("setAsDefault")
@@ -1174,6 +1246,285 @@ def upload_image():
         mime_type=body.get("imageMimeType"),
     )
     return {"data": upload_result}
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """
+    Parse ISO datetime into timezone-aware UTC datetime.
+    Accepts both "...Z" and "...+00:00" formats.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_iso_utc(dt: datetime) -> str:
+    dt_utc = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt_utc.isoformat().replace("+00:00", "Z")
+
+
+def _compute_plan_end_at(paid_at_iso: str, billing_cycle: str | None) -> str | None:
+    """
+    Billing rules:
+    - Start time: exact paidAt timestamp
+    - Monthly: add 31 days, then set "next day 00:00"
+    - Yearly: add 365 days, then set "next day 00:00"
+    Example: paidAt=2026-03-31 15:00
+      - Monthly endAt => 2026-05-02 00:00
+    """
+    paid_dt = _parse_iso_utc(paid_at_iso)
+    if not paid_dt:
+        return None
+    cycle = (billing_cycle or "monthly").strip().lower()
+    add_days = 365 if cycle == "yearly" else 31
+    end_date = (paid_dt + timedelta(days=add_days)).date() + timedelta(days=1)
+    end_dt = datetime(
+        year=end_date.year,
+        month=end_date.month,
+        day=end_date.day,
+        hour=0,
+        minute=0,
+        second=0,
+        tzinfo=timezone.utc,
+    )
+    return _format_iso_utc(end_dt)
+
+
+def _get_latest_paid_payment_order(user_id: str) -> dict | None:
+    try:
+        resp = payment_order_table.query(
+            IndexName="gsi_user_created",
+            KeyConditionExpression=Key("userId").eq(user_id),
+            ScanIndexForward=False,
+            Limit=10,
+        )
+    except ClientError:
+        # Caller decides whether to handle DB errors.
+        raise
+    items = resp.get("Items", []) or []
+    for item in items:
+        if (item.get("status") or "").strip() == "paid":
+            return item
+    return None
+
+
+def _get_payment_validity_for_user(user_id: str) -> dict:
+    now_dt = datetime.now(timezone.utc)
+    order = _get_latest_paid_payment_order(user_id)
+    if not order:
+        return {"isPaid": False}
+
+    paid_at_iso = order.get("paidAt") or order.get("paid_at") or ""
+    billing_cycle = order.get("billingCycle") or order.get("billing_cycle") or "monthly"
+
+    plan_start_at = order.get("planStartAt") or order.get("plan_start_at") or paid_at_iso
+    plan_end_at = order.get("planEndAt") or order.get("plan_end_at") or ""
+    if not plan_end_at:
+        plan_end_at = _compute_plan_end_at(paid_at_iso, billing_cycle) or ""
+
+    is_active = False
+    plan_end_dt = _parse_iso_utc(plan_end_at)
+    if plan_end_dt:
+        is_active = now_dt < plan_end_dt
+
+    # Best-effort writeback for older records missing plan fields.
+    if (order.get("status") or "").strip() == "paid" and (plan_start_at and plan_end_at):
+        changed = False
+        updated = dict(order)
+        if not updated.get("planStartAt") and plan_start_at:
+            updated["planStartAt"] = plan_start_at
+            changed = True
+        if not updated.get("planEndAt") and plan_end_at:
+            updated["planEndAt"] = plan_end_at
+            changed = True
+        if changed:
+            updated["updatedAt"] = now_iso()
+            payment_order_table.put_item(Item=updated)
+
+    return {
+        "isPaid": is_active,
+        "planName": order.get("planName"),
+        "billingCycle": billing_cycle,
+        "paidAt": paid_at_iso or None,
+        "planStartAt": plan_start_at or None,
+        "planEndAt": plan_end_at or None,
+    }
+
+
+@app.route("/v1/payments/orders", methods=["POST"])
+def create_payment_order():
+    _payment_log("=== POST /v1/payments/orders 開始 ===")
+    try:
+        user = _require_auth()
+    except PermissionError:
+        _payment_log("步驟: 認證失敗 (未登入或 token 無效)")
+        return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
+
+    body = _json()
+    billing_cycle = str(body.get("billingCycle") or body.get("cycle") or "monthly").strip() or "monthly"
+    _payment_log(f"步驟 1: 認證通過 userId={user['sub']!r}, billingCycle={billing_cycle!r}")
+    _payment_log("步驟 2: 呼叫 chalicelib.linepay.post_linepay_order()（requests 寫死 payload / key）")
+
+    try:
+        resp_body = post_linepay_order()
+    except ValueError as exc:
+        msg = str(exc)
+        _payment_log(f"步驟 3: 金流呼叫失敗 ValueError: {msg}")
+        if "LINE Pay service HTTP 401" in msg or "401" in msg:
+            return error("PAYMENT_GATEWAY_UNAUTHORIZED", msg, 401)
+        if "LINE Pay service HTTP 403" in msg or " HTTP 403" in msg:
+            hint = " 請確認金流 key 與後台設定。"
+            return error("PAYMENT_GATEWAY_FORBIDDEN", msg + hint, 403)
+        return error("PAYMENT_GATEWAY_ERROR", msg, 502)
+
+    _payment_log(f"步驟 3: 金流回應 keys={list(resp_body.keys()) if isinstance(resp_body, dict) else 'n/a'}")
+    _payment_log(f"步驟 3: 金流回應 (截斷 800 字) = {json.dumps(resp_body, ensure_ascii=False)[:800]}")
+
+    order_id, payment_url = _extract_linepay_order_response(resp_body)
+    _payment_log(f"步驟 4: 解析 order_id={order_id!r}, payment_url 有值={bool(payment_url)}")
+    if not order_id or not payment_url:
+        _payment_log("中止: 無法從金流回應取得 order_id 或 payment_url")
+        return error(
+            "PAYMENT_GATEWAY_ERROR",
+            f"Invalid response from payment service: {json.dumps(resp_body, ensure_ascii=False)[:500]}",
+            502,
+        )
+
+    linepay_status = resp_body.get("status") if isinstance(resp_body, dict) else None
+    product_name_display = "圖文選單費用"
+    amount = 1
+
+    now = now_iso()
+    item = {
+        "orderId": order_id,
+        "userId": user["sub"],
+        "productName": product_name_display,
+        "planName": "pro",
+        "billingCycle": billing_cycle,
+        "amount": amount,
+        "currency": "TWD",
+        "status": "pending",
+        "paymentUrl": payment_url,
+        "linepayResponseStatus": linepay_status,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    table_name = os.environ.get("PAYMENT_ORDER_TABLE", "line_payment_order")
+    _payment_log(f"步驟 13: 寫入 DynamoDB table={table_name!r}, orderId={order_id!r}, userId={user['sub']!r}")
+    try:
+        payment_order_table.put_item(Item=item)
+    except ClientError as exc:
+        err = exc.response.get("Error") or {}
+        code = err.get("Code", "ClientError")
+        msg = err.get("Message", str(exc))
+        _payment_log(f"中止: DynamoDB put_item 失敗 code={code}, message={msg}")
+        return error(
+            "DATABASE_ERROR",
+            f"{code}: {msg}. If the table is missing, run deploy_dynamodb.sh to create line_payment_order.",
+            503,
+        )
+
+    _payment_log("步驟 14: 成功，回傳 orderId 與 paymentUrl 給前端")
+    _payment_log("=== POST /v1/payments/orders 結束 ===")
+    return {"data": {"orderId": order_id, "paymentUrl": payment_url}}
+
+
+@app.route("/v1/payments/orders", methods=["GET"])
+def list_payment_orders():
+    try:
+        user = _require_auth()
+    except PermissionError:
+        return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
+
+    try:
+        resp = payment_order_table.query(
+            IndexName="gsi_user_created",
+            KeyConditionExpression=Key("userId").eq(user["sub"]),
+            ScanIndexForward=False,
+        )
+    except ClientError as exc:
+        err = exc.response.get("Error") or {}
+        return error(
+            "DATABASE_ERROR",
+            f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}",
+            503,
+        )
+    items = [_normalize_dynamo_numbers(i) for i in resp.get("Items", [])]
+    return {"data": items}
+
+
+@app.route("/v1/payments/check", methods=["GET"])
+def check_payment():
+    try:
+        user = _require_auth()
+    except PermissionError:
+        return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
+
+    try:
+        validity = _get_payment_validity_for_user(user["sub"])
+    except ClientError as exc:
+        err = exc.response.get("Error") or {}
+        return error(
+            "DATABASE_ERROR",
+            f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}",
+            503,
+        )
+
+    return {"data": validity}
+
+
+@app.route("/v1/payments/callback", methods=["GET"])
+def payment_callback():
+    qp = app.current_request.query_params or {}
+    order_id = (qp.get("order_id") or "").strip()
+    ts = (qp.get("ts") or "").strip()
+    sig = (qp.get("sig") or "").strip()
+
+    if not order_id or not ts or not sig:
+        return error("INVALID_CALLBACK", "Missing required parameters", 400)
+
+    company_key = (os.environ.get("LINEPAY_COMPANY_KEY") or "").strip()
+    hash_key = (os.environ.get("LINEPAY_HASH_KEY") or "").strip()
+    if not company_key or not hash_key:
+        return error("CONFIG_ERROR", "LINEPAY_COMPANY_KEY and LINEPAY_HASH_KEY must be configured", 500)
+
+    if not verify_payment_callback(company_key, hash_key, order_id, ts, sig):
+        return error("INVALID_SIGNATURE", "Signature verification failed", 401)
+
+    resp = payment_order_table.get_item(Key={"orderId": order_id})
+    order = resp.get("Item")
+    if not order:
+        return error("ORDER_NOT_FOUND", "Order does not exist", 404)
+
+    billing_cycle = order.get("billingCycle") or order.get("billing_cycle") or "monthly"
+    paid_at_iso = order.get("paidAt") or order.get("paid_at") or ""
+
+    if order.get("status") != "paid":
+        paid_at_iso = now_iso()
+
+    plan_start_at = paid_at_iso
+    plan_end_at = _compute_plan_end_at(paid_at_iso, billing_cycle)
+
+    should_update = order.get("status") != "paid" or not order.get("planStartAt") or not order.get("planEndAt")
+    if should_update and paid_at_iso and plan_end_at:
+        updated = dict(order)
+        updated["status"] = "paid"
+        updated["paidAt"] = paid_at_iso
+        updated["planStartAt"] = plan_start_at
+        updated["planEndAt"] = plan_end_at
+        updated["updatedAt"] = now_iso()
+        payment_order_table.put_item(Item=updated)
+
+    return Response(status_code=200, body="OK", headers={"Content-Type": "text/plain; charset=utf-8"})
 
 
 @app.route("/", methods=["GET"])

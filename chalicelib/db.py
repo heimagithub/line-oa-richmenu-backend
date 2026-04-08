@@ -14,6 +14,7 @@ users_table = _dynamodb.Table(os.environ.get("USERS_TABLE", "line_user"))
 oa_table = _dynamodb.Table(os.environ.get("OA_TABLE", "line_oa"))
 richmenu_table = _dynamodb.Table(os.environ.get("RICHMENU_TABLE", "line_richmenu"))
 publish_job_table = _dynamodb.Table(os.environ.get("PUBLISH_JOB_TABLE", "line_richmenu_publish_job"))
+payment_order_table = _dynamodb.Table(os.environ.get("PAYMENT_ORDER_TABLE", "line_payment_order"))
 
 
 def get_user_by_email(email: str):
