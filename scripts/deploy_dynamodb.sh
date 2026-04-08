@@ -55,7 +55,7 @@ create_table_if_missing \
 create_table_if_missing \
   "line_payment_order" \
   '[{"AttributeName":"orderId","KeyType":"HASH"}]' \
-  '[{"AttributeName":"orderId","AttributeType":"S"},{"AttributeName":"userId","AttributeType":"S"},{"AttributeName":"createdAt","AttributeType":"S"}]' \
-  '[{"IndexName":"gsi_user_created","KeySchema":[{"AttributeName":"userId","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]'
+  '[{"AttributeName":"orderId","AttributeType":"S"},{"AttributeName":"userId","AttributeType":"S"},{"AttributeName":"createdAt","AttributeType":"S"},{"AttributeName":"oaId","AttributeType":"S"}]' \
+  '[{"IndexName":"gsi_user_created","KeySchema":[{"AttributeName":"userId","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}},{"IndexName":"gsi_oa_created","KeySchema":[{"AttributeName":"oaId","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]'
 
 echo "All DynamoDB tables are ready."

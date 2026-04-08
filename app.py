@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from botocore.exceptions import ClientError
@@ -15,12 +16,10 @@ from chalicelib.auth import (
     create_refresh_token,
     decode_access_token,
     decode_refresh_token,
-    hash_password,
-    verify_password,
 )
 from chalicelib.db import (
     get_user_by_id,
-    get_user_by_email,
+    get_user_by_line_sub,
     list_oa,
     list_richmenus,
     now_iso,
@@ -263,6 +262,69 @@ def _fetch_line_bot_info(channel_access_token: str) -> dict:
         raise ValueError("Invalid LINE API response") from exc
 
 
+def _exchange_line_login_code(code: str) -> dict:
+    channel_id = (os.environ.get("LINE_LOGIN_CHANNEL_ID") or "").strip()
+    channel_secret = (os.environ.get("LINE_LOGIN_CHANNEL_SECRET") or "").strip()
+    redirect_uri = (os.environ.get("LINE_LOGIN_REDIRECT_URI") or "").strip()
+    if not channel_id or not channel_secret or not redirect_uri:
+        raise ValueError("LINE Login environment variables are not configured")
+
+    form = urlencode(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": channel_id,
+            "client_secret": channel_secret,
+        }
+    ).encode("utf-8")
+    req = Request(
+        url="https://api.line.me/oauth2/v2.1/token",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=form,
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload) if payload else {}
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8")
+        except Exception:
+            body = ""
+        raise ValueError(f"LINE token exchange failed: {exc.code} {body}".strip()) from exc
+    except Exception as exc:
+        raise ValueError("LINE token exchange failed") from exc
+
+
+def _verify_line_id_token(id_token: str) -> dict:
+    channel_id = (os.environ.get("LINE_LOGIN_CHANNEL_ID") or "").strip()
+    if not channel_id:
+        raise ValueError("LINE_LOGIN_CHANNEL_ID is not configured")
+    form = urlencode({"id_token": id_token, "client_id": channel_id}).encode("utf-8")
+    req = Request(
+        url="https://api.line.me/oauth2/v2.1/verify",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=form,
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload) if payload else {}
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8")
+        except Exception:
+            body = ""
+        raise ValueError(f"LINE id_token verify failed: {exc.code} {body}".strip()) from exc
+    except Exception as exc:
+        raise ValueError("LINE id_token verify failed") from exc
+
+
 def _download_image(url: str) -> tuple[bytes, str | None]:
     req = Request(url=url, method="GET")
     with urlopen(req, timeout=20) as resp:
@@ -437,46 +499,53 @@ def _ensure_richmenu_access(oa_id: str, richmenu_id: str, user_id: str):
     return item
 
 
-@app.route("/v1/auth/register", methods=["POST"])
-def register():
+@app.route("/v1/auth/line-login", methods=["POST"])
+def line_login():
     body = _json()
-    name = (body.get("name") or "").strip()
-    email = (body.get("email") or "").strip()
-    password = body.get("password") or ""
-    confirm = body.get("confirmPassword") or ""
-    if not name or not email or not password or password != confirm:
-        return error("VALIDATION_ERROR", "invalid register payload", 400)
+    code = (body.get("code") or "").strip()
+    if not code:
+        return error("VALIDATION_ERROR", "LINE authorization code is required", 400)
+    try:
+        token_payload = _exchange_line_login_code(code)
+        id_token = (token_payload.get("id_token") or "").strip()
+        if not id_token:
+            return error("AUTH_INVALID_LINE_TOKEN", "LINE id_token not found", 401)
+        profile = _verify_line_id_token(id_token)
+    except ValueError as exc:
+        return error("AUTH_LINE_LOGIN_FAILED", str(exc), 401)
 
-    exists = get_user_by_email(email)
-    if exists:
-        return error("AUTH_EMAIL_ALREADY_EXISTS", "Email already registered", 409)
+    line_sub = (profile.get("sub") or "").strip()
+    if not line_sub:
+        return error("AUTH_LINE_LOGIN_FAILED", "LINE user sub is missing", 401)
 
-    user_id = f"u_{uuid.uuid4().hex[:8]}"
     now = now_iso()
-    users_table.put_item(
-        Item={
-            "userId": user_id,
+    name = (profile.get("name") or "").strip() or "LINE User"
+    email = (profile.get("email") or "").strip()
+    picture = (profile.get("picture") or "").strip()
+    user = get_user_by_line_sub(line_sub)
+    if not user:
+        user = {
+            "userId": f"u_{uuid.uuid4().hex[:8]}",
+            "lineSub": line_sub,
             "name": name,
             "email": email,
-            "emailNormalized": email.lower(),
-            "passwordHash": hash_password(password),
+            "emailNormalized": email.lower() if email else "",
+            "avatarUrl": picture,
             "role": "editor",
             "status": "active",
             "createdAt": now,
             "updatedAt": now,
         }
-    )
-    return {"data": {"user": {"userId": user_id, "name": name, "email": email, "role": "editor", "createdAt": now}}}
-
-
-@app.route("/v1/auth/login", methods=["POST"])
-def login():
-    body = _json()
-    email = (body.get("email") or "").strip().lower()
-    password = body.get("password") or ""
-    user = get_user_by_email(email)
-    if not user or not verify_password(password, user.get("passwordHash", "")):
-        return error("AUTH_INVALID_CREDENTIALS", "Email or password is incorrect", 401)
+    else:
+        user = dict(user)
+        user["lineSub"] = line_sub
+        user["name"] = name
+        user["avatarUrl"] = picture
+        if email:
+            user["email"] = email
+            user["emailNormalized"] = email.lower()
+        user["updatedAt"] = now
+    users_table.put_item(Item=user)
     return _issue_auth_response(user)
 
 
@@ -697,6 +766,7 @@ def create_richmenu():
         "areas": body.get("areas", []),
         "status": "draft",
         "isDefault": False,
+        "selected": bool(body.get("selected", False)),
         "ownerUserId": user["sub"],
         "createdBy": user["sub"],
         "updatedBy": user["sub"],
@@ -740,7 +810,7 @@ def update_richmenu(richmenu_id):
     item = _ensure_richmenu_access(oa_id, richmenu_id, user["sub"])
     if not item:
         return error("NOT_FOUND", "richmenu not found", 404)
-    for key in ["name", "description", "chatBarText", "imageUrl", "size", "areas"]:
+    for key in ["name", "description", "chatBarText", "imageUrl", "size", "areas", "selected"]:
         if key in body:
             item[key] = body[key]
     if body.get("imageBase64"):
@@ -825,7 +895,7 @@ def publish_richmenu(richmenu_id):
 
     if not test_publish_without_payment:
         try:
-            validity = _get_payment_validity_for_user(user["sub"])
+            validity = _get_payment_validity_for_oa(oa_id)
         except ClientError as exc:
             err = exc.response.get("Error") or {}
             return error(
@@ -1299,11 +1369,11 @@ def _compute_plan_end_at(paid_at_iso: str, billing_cycle: str | None) -> str | N
     return _format_iso_utc(end_dt)
 
 
-def _get_latest_paid_payment_order(user_id: str) -> dict | None:
+def _get_latest_paid_payment_order(oa_id: str) -> dict | None:
     try:
         resp = payment_order_table.query(
-            IndexName="gsi_user_created",
-            KeyConditionExpression=Key("userId").eq(user_id),
+            IndexName="gsi_oa_created",
+            KeyConditionExpression=Key("oaId").eq(oa_id),
             ScanIndexForward=False,
             Limit=10,
         )
@@ -1317,9 +1387,9 @@ def _get_latest_paid_payment_order(user_id: str) -> dict | None:
     return None
 
 
-def _get_payment_validity_for_user(user_id: str) -> dict:
+def _get_payment_validity_for_oa(oa_id: str) -> dict:
     now_dt = datetime.now(timezone.utc)
-    order = _get_latest_paid_payment_order(user_id)
+    order = _get_latest_paid_payment_order(oa_id)
     if not order:
         return {"isPaid": False}
 
@@ -1370,8 +1440,16 @@ def create_payment_order():
         return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
 
     body = _json()
+    oa_id = (body.get("oaId") or "").strip()
+    if not oa_id:
+        return error("VALIDATION_ERROR", "oaId is required", 400)
+    oa_item = _ensure_oa_access(oa_id, user["sub"])
+    if not oa_item:
+        return error("NOT_FOUND", "oa not found", 404)
     billing_cycle = str(body.get("billingCycle") or body.get("cycle") or "monthly").strip() or "monthly"
-    _payment_log(f"步驟 1: 認證通過 userId={user['sub']!r}, billingCycle={billing_cycle!r}")
+    _payment_log(
+        f"步驟 1: 認證通過 userId={user['sub']!r}, oaId={oa_id!r}, billingCycle={billing_cycle!r}"
+    )
     _payment_log("步驟 2: 呼叫 chalicelib.linepay.post_linepay_order()（requests 寫死 payload / key）")
 
     try:
@@ -1407,6 +1485,7 @@ def create_payment_order():
     item = {
         "orderId": order_id,
         "userId": user["sub"],
+        "oaId": oa_id,
         "productName": product_name_display,
         "planName": "pro",
         "billingCycle": billing_cycle,
@@ -1419,7 +1498,9 @@ def create_payment_order():
         "updatedAt": now,
     }
     table_name = os.environ.get("PAYMENT_ORDER_TABLE", "line_payment_order")
-    _payment_log(f"步驟 13: 寫入 DynamoDB table={table_name!r}, orderId={order_id!r}, userId={user['sub']!r}")
+    _payment_log(
+        f"步驟 13: 寫入 DynamoDB table={table_name!r}, orderId={order_id!r}, userId={user['sub']!r}, oaId={oa_id!r}"
+    )
     try:
         payment_order_table.put_item(Item=item)
     except ClientError as exc:
@@ -1469,8 +1550,16 @@ def check_payment():
     except PermissionError:
         return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
 
+    qp = app.current_request.query_params or {}
+    oa_id = (qp.get("oaId") or "").strip()
+    if not oa_id:
+        return error("VALIDATION_ERROR", "oaId is required", 400)
+    oa_item = _ensure_oa_access(oa_id, user["sub"])
+    if not oa_item:
+        return error("NOT_FOUND", "oa not found", 404)
+
     try:
-        validity = _get_payment_validity_for_user(user["sub"])
+        validity = _get_payment_validity_for_oa(oa_id)
     except ClientError as exc:
         err = exc.response.get("Error") or {}
         return error(

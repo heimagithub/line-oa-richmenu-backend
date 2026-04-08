@@ -27,6 +27,16 @@ def get_user_by_email(email: str):
     return items[0] if items else None
 
 
+def get_user_by_line_sub(line_sub: str):
+    normalized = (line_sub or "").strip()
+    if not normalized:
+        return None
+    # Use scan for compatibility with existing tables that may not have GSI on lineSub yet.
+    resp = users_table.scan(FilterExpression=Attr("lineSub").eq(normalized), Limit=1)
+    items = resp.get("Items", [])
+    return items[0] if items else None
+
+
 def get_user_by_id(user_id: str):
     return users_table.get_item(Key={"userId": user_id}).get("Item")
 
