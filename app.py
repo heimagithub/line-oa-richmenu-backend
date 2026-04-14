@@ -48,7 +48,7 @@ app.debug = True
 app.api.cors = CORSConfig(
     allow_origin=os.environ.get("CORS_ALLOW_ORIGIN", "http://localhost:3001"),
     allow_credentials=True,
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Token"],
 )
 
 ACCESS_COOKIE_NAME = "access_token"
@@ -182,6 +182,20 @@ def _require_auth():
     if not payload:
         raise PermissionError()
     return payload
+
+
+def _get_admin_token_from_header() -> str:
+    headers = app.current_request.headers or {}
+    return (headers.get("x-admin-token") or headers.get("X-Admin-Token") or "").strip()
+
+
+def _require_admin_token():
+    expected = (os.environ.get("ADMIN_CRON_TOKEN") or "").strip()
+    if not expected:
+        raise RuntimeError("ADMIN_CRON_TOKEN is not configured")
+    request_token = _get_admin_token_from_header()
+    if not request_token or request_token != expected:
+        raise PermissionError("Invalid admin token")
 
 
 def _normalize_dynamo_numbers(item):
@@ -1342,6 +1356,23 @@ def _format_iso_utc(dt: datetime) -> str:
     return dt_utc.isoformat().replace("+00:00", "Z")
 
 
+def _get_plan_cleanup_due_at(plan_end_at_iso: str | None, grace_days: int = 14) -> datetime | None:
+    """
+    Convert plan end time to cleanup due time (plan end + grace days).
+    """
+    plan_end_dt = _parse_iso_utc(plan_end_at_iso)
+    if not plan_end_dt:
+        return None
+    return plan_end_dt + timedelta(days=grace_days)
+
+
+def _is_plan_cleanup_due(plan_end_at_iso: str | None, grace_days: int = 14) -> bool:
+    due_at = _get_plan_cleanup_due_at(plan_end_at_iso, grace_days=grace_days)
+    if not due_at:
+        return False
+    return datetime.now(timezone.utc) > due_at
+
+
 def _compute_plan_end_at(paid_at_iso: str, billing_cycle: str | None) -> str | None:
     """
     Billing rules:
@@ -1428,6 +1459,204 @@ def _get_payment_validity_for_oa(oa_id: str) -> dict:
         "planStartAt": plan_start_at or None,
         "planEndAt": plan_end_at or None,
     }
+
+@app.route("/v1/admin/cron/cleanup-expired-richmenus", methods=["POST"])
+def admin_cleanup_expired_richmenus():
+    """
+    排程專用 API：定期掃描並清理過期超過指定寬限期（14天）的 OA 圖文選單。
+    """
+    
+    # ==========================================
+    # 1. 權限驗證 (Authentication)
+    # ==========================================
+    try:
+        _require_admin_token()
+    except RuntimeError as exc:
+        return error("CONFIG_ERROR", str(exc), 500)
+    except PermissionError as exc:
+        return error("AUTH_UNAUTHORIZED", str(exc), 401)
+
+    body = _json()
+    oa_id_filters_raw = body.get("oaIds") if isinstance(body, dict) else None
+    oa_id_filters = set()
+    if isinstance(oa_id_filters_raw, list):
+        oa_id_filters = {str(item).strip() for item in oa_id_filters_raw if str(item).strip()}
+    raw_grace_days = body.get("graceDays") if isinstance(body, dict) else None
+    if raw_grace_days is None or str(raw_grace_days).strip() == "":
+        grace_days = 14
+    else:
+        try:
+            grace_days = int(raw_grace_days)
+        except (TypeError, ValueError):
+            return error("VALIDATION_ERROR", "graceDays must be an integer", 400)
+
+    now = now_iso()
+    scanned_oas = []
+    scan_kwargs = {}
+    processed_details = []
+    failed_details = []
+
+    # ==========================================
+    # 2. 獲取全域 OA 列表 (DynamoDB Table Scan)
+    # ==========================================
+    try:
+        while True:
+            scan_resp = oa_table.scan(**scan_kwargs)
+            scanned_oas.extend(scan_resp.get("Items", []))
+            
+            last_evaluated_key = scan_resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+            scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+    except ClientError as exc:
+        err = exc.response.get("Error") or {}
+        return error(
+            "DATABASE_ERROR",
+            f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}",
+            503,
+        )
+
+    # ==========================================
+    # 3. 逐一檢查 OA 的付費狀態與過期判定
+    # ==========================================
+    for oa in scanned_oas:
+        oa_id = (oa.get("oaId") or "").strip()
+        if not oa_id:
+            continue
+        if oa_id_filters and oa_id not in oa_id_filters:
+            continue
+            
+        try:
+            validity = _get_payment_validity_for_oa(oa_id)
+        except Exception as exc:
+            failed_details.append({"oaId": oa_id, "reason": f"Failed to read payment validity: {str(exc)}"})
+            continue
+
+        if validity.get("isPaid"):
+            continue
+            
+        plan_end_at = validity.get("planEndAt")
+        
+        # 檢查是否超過 14 天寬限期
+        if not _is_plan_cleanup_due(plan_end_at, grace_days=grace_days):
+            continue
+
+        channel_access_token = (oa.get("channelAccessTokenEnc") or "").strip()
+        if not channel_access_token:
+            failed_details.append({"oaId": oa_id, "reason": "Missing channelAccessToken"})
+            continue
+
+        removed_richmenu_ids = []
+        removed_alias_ids = []
+        failed_richmenus = []
+
+        # ==========================================
+        # 4. 執行 LINE API 精準清理作業與資料庫狀態重置
+        # ==========================================
+        try:
+            # [步驟 A] 撈取該 OA 擁有的所有圖文選單 (處理 DynamoDB Query 分頁)
+            query_kwargs = {"KeyConditionExpression": Key("oaId").eq(oa_id)}
+            oa_richmenus = []
+            while True:
+                rm_resp = richmenu_table.query(**query_kwargs)
+                oa_richmenus.extend(rm_resp.get("Items", []))
+                
+                rm_last_key = rm_resp.get("LastEvaluatedKey")
+                if not rm_last_key:
+                    break
+                query_kwargs["ExclusiveStartKey"] = rm_last_key
+
+            # [步驟 B] 針對資料庫內有紀錄的選單，逐一刪除 LINE 端實體與 Alias
+            for rm in oa_richmenus:
+                line_richmenu_id = (rm.get("lineRichMenuId") or "").strip()
+                richmenu_id = (rm.get("richMenuId") or "").strip()
+                
+                # 若無 lineRichMenuId，代表未曾發佈，直接略過
+                if not line_richmenu_id:
+                    continue
+
+                # 1. 刪除 LINE 端綁定的 Alias
+                if richmenu_id:
+                    try:
+                        _line_request(
+                            method="DELETE",
+                            url=f"https://api.line.me/v2/bot/richmenu/alias/{richmenu_id}",
+                            channel_access_token=channel_access_token,
+                            content_type=None,
+                        )
+                        removed_alias_ids.append(richmenu_id)
+                    except Exception:
+                        pass # 容錯：Alias 可能已不存在
+
+                # 2. 刪除 LINE 端的圖文選單實體
+                is_line_deleted = False
+                try:
+                    _line_request(
+                        method="DELETE",
+                        url=f"https://api.line.me/v2/bot/richmenu/{line_richmenu_id}",
+                        channel_access_token=channel_access_token,
+                        content_type=None,
+                    )
+                    removed_richmenu_ids.append(line_richmenu_id)
+                    is_line_deleted = True
+                except Exception as exc:
+                    err_msg = str(exc)
+                    # LINE 回 404 視同該選單已不存在，允許同步 DB 狀態
+                    if "404" in err_msg:
+                        removed_richmenu_ids.append(line_richmenu_id)
+                        is_line_deleted = True
+                    else:
+                        failed_richmenus.append(
+                            {
+                                "richMenuId": richmenu_id,
+                                "lineRichMenuId": line_richmenu_id,
+                                "reason": err_msg,
+                            }
+                        )
+
+                # [步驟 C] 僅當 LINE 端已確認刪除（或已不存在）才更新 DB 為草稿
+                if is_line_deleted:
+                    rm["status"] = "draft"
+                    rm["isDefault"] = False
+                    rm["lineRichMenuId"] = None
+                    rm["updatedAt"] = now
+                    rm["statusUpdatedAt"] = f"draft#{now}"
+                    richmenu_table.put_item(Item=rm)
+
+            cleanup_due_at = _get_plan_cleanup_due_at(plan_end_at, grace_days=grace_days)
+            processed_details.append(
+                {
+                    "oaId": oa_id,
+                    "planEndAt": plan_end_at,
+                    "cleanupDueAt": _format_iso_utc(cleanup_due_at) if cleanup_due_at else None,
+                    "removedLineRichMenuCount": len(removed_richmenu_ids),
+                    "removedLineRichMenuIds": removed_richmenu_ids,
+                    "removedAliasCount": len(removed_alias_ids),
+                    "removedAliasIds": removed_alias_ids,
+                    "failedRichmenus": failed_richmenus,
+                }
+            )
+        except Exception as exc:
+            failed_details.append({"oaId": oa_id, "reason": f"Cleanup failed: {str(exc)}"})
+
+    # ==========================================
+    # 5. 回傳排程執行結果總結
+    # ==========================================
+    return success(
+        {
+            "summary": {
+                "totalOasScanned": len(scanned_oas),
+                "oaFilterEnabled": bool(oa_id_filters),
+                "oaFilterCount": len(oa_id_filters),
+                "graceDays": grace_days,
+                "expiredOasProcessed": len(processed_details),
+                "failedOas": len(failed_details),
+                "executedAt": now,
+            },
+            "processedDetails": processed_details,
+            "failedDetails": failed_details,
+        }
+    )
 
 
 @app.route("/v1/payments/orders", methods=["POST"])
