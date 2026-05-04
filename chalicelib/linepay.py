@@ -22,19 +22,69 @@ def payment_signature_hex(hash_key: str, message: str) -> str:
     return hmac.new(hash_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def verify_payment_callback(company_key: str, hash_key: str, order_id: str, ts: str, sig: str) -> bool:
+def build_callback_signed_message(
+    *,
+    company_key: str,
+    order_id: str,
+    ts: str,
+    amount: str,
+    status: str,
+) -> str:
+    # 鎖定欄位順序，前後端要一致；金額與狀態納入簽章避免 callback 被竄改。
+    parts = [
+        f"amount={amount}",
+        f"company_key={company_key}",
+        f"order_id={order_id}",
+        f"status={status}",
+        f"ts={ts}",
+    ]
+    return "&".join(parts)
+
+
+def verify_simple_payment_callback(
+    company_key: str,
+    hash_key: str,
+    *,
+    order_id: str,
+    ts: str,
+    sig: str,
+) -> bool:
+    # Payment service 的 GET callback 簽章格式（僅含 company_key/order_id/ts）
     msg = f"company_key={company_key}&order_id={order_id}&ts={ts}"
     expected = payment_signature_hex(hash_key, msg)
     return hmac.compare_digest(expected, sig)
 
 
-def post_linepay_order() -> dict:
+def verify_payment_callback(
+    company_key: str,
+    hash_key: str,
+    *,
+    order_id: str,
+    ts: str,
+    amount: str,
+    status: str,
+    sig: str,
+) -> bool:
+    msg = build_callback_signed_message(
+        company_key=company_key,
+        order_id=order_id,
+        ts=ts,
+        amount=amount,
+        status=status,
+    )
+    expected = payment_signature_hex(hash_key, msg)
+    return hmac.compare_digest(expected, sig)
+
+
+def post_linepay_order(*, amount: int, product_name: str = "圖文選單費用") -> dict:
     """
     呼叫金流建立訂單。環境變數：
     - LINEPAY_ORDERS_URL（預設 https://line-payment-service.vibelinai.com/orders/）
     - LINEPAY_COMPANY_KEY（header key）
     - LINEPAY_WRITE_KEY（header write_key）
     成功時回傳 JSON，通常含 status, order_id, payment_url。
+
+    amount 改由呼叫端決定，避免在這裡硬寫死導致金流邏輯被繞過。
     """
     _linepay_log("--- post_linepay_order 開始 ---")
     orders_url = (os.environ.get("LINEPAY_ORDERS_URL") or "").strip() or "https://line-payment-service.vibelinai.com/orders/"
@@ -43,9 +93,12 @@ def post_linepay_order() -> dict:
     if not company_key or not write_key:
         raise ValueError("LINEPAY_COMPANY_KEY and LINEPAY_WRITE_KEY must be set in the environment")
 
+    if not isinstance(amount, int) or amount <= 0:
+        raise ValueError("amount must be a positive integer")
+
     payload = {
-        "product_name": "圖文選單費用",
-        "amount": 1,
+        "product_name": product_name,
+        "amount": amount,
         "currency": "TWD",
         "product_image_url": "",
     }

@@ -1,11 +1,17 @@
+from __future__ import annotations
+
+import io
 import os
+import time
 import uuid
 import json
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from PIL import Image
 
 from botocore.exceptions import ClientError
 from chalice import Chalice, CORSConfig, Response
@@ -29,9 +35,11 @@ from chalicelib.db import (
     richmenu_table,
     users_table,
 )
+from chalicelib.crypto import decrypt_secret, encrypt_secret
 from chalicelib.http import error, success
-from chalicelib.linepay import post_linepay_order, verify_payment_callback
+from chalicelib.linepay import post_linepay_order, verify_payment_callback, verify_simple_payment_callback
 from chalicelib.storage import (
+    InvalidImageError,
     get_richmenu_image_url,
     upload_oa_avatar_bytes,
     upload_richmenu_image_base64,
@@ -44,7 +52,11 @@ def _payment_log(msg: str) -> None:
     print(f"[payments/orders] {msg}", flush=True)
 
 
-app.debug = True
+def _is_prod_stage() -> bool:
+    return (os.environ.get("CHALICE_STAGE") or "").strip().lower() == "prod"
+
+
+app.debug = not _is_prod_stage()
 app.api.cors = CORSConfig(
     allow_origin=os.environ.get("CORS_ALLOW_ORIGIN", "http://localhost:3001"),
     allow_credentials=True,
@@ -54,7 +66,8 @@ app.api.cors = CORSConfig(
 ACCESS_COOKIE_NAME = "access_token"
 REFRESH_COOKIE_NAME = "refresh_token"
 # 僅此帳號可在登入／refresh 的 JSON 回應中取得 access_token（其餘帳號僅能透過 HttpOnly cookie）
-DEBUG_ACCESS_TOKEN_EMAIL = "heima@gmail.com"
+# 從環境變數讀取以避免將個人 email 寫進原始碼；未設定時視為「無 debug 帳號」
+DEBUG_ACCESS_TOKEN_EMAIL = (os.environ.get("DEBUG_ACCESS_TOKEN_EMAIL") or "").strip().lower()
 ACCESS_TOKEN_TTL_SECONDS = 2 * 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
@@ -123,16 +136,28 @@ def _build_auth_payload(user):
 
 
 def _issue_auth_response(user):
+    token_version = int(user.get("tokenVersion") or 0)
     access_token = create_access_token(
-        user["userId"], user.get("role", "editor"), ttl_seconds=ACCESS_TOKEN_TTL_SECONDS
+        user["userId"],
+        user.get("role", "editor"),
+        ttl_seconds=ACCESS_TOKEN_TTL_SECONDS,
+        token_version=token_version,
     )
     refresh_token = create_refresh_token(
-        user["userId"], user.get("role", "editor"), ttl_seconds=REFRESH_TOKEN_TTL_SECONDS
+        user["userId"],
+        user.get("role", "editor"),
+        ttl_seconds=REFRESH_TOKEN_TTL_SECONDS,
+        token_version=token_version,
     )
     auth_payload = _build_auth_payload(user)
     body = {"data": auth_payload}
     email_normalized = (user.get("email") or "").strip().lower()
-    if email_normalized == DEBUG_ACCESS_TOKEN_EMAIL:
+    # production stage 一律不在 JSON body 回傳 access_token，避免後門帳號變成永久繞過
+    if (
+        not _is_prod_stage()
+        and DEBUG_ACCESS_TOKEN_EMAIL
+        and email_normalized == DEBUG_ACCESS_TOKEN_EMAIL
+    ):
         body["data"]["access_token"] = access_token
     set_cookies = [
         _cookie_header(ACCESS_COOKIE_NAME, access_token, ACCESS_TOKEN_TTL_SECONDS),
@@ -159,22 +184,41 @@ def _get_all_cookies():
     return cookies
 
 
-def _auth():
+def _decode_access_payload():
     cookies = _get_all_cookies()
     token = cookies.get(ACCESS_COOKIE_NAME)
     if token:
         try:
             return decode_access_token(token)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[auth] cookie access_token decode failed: {exc}", flush=True)
     auth = (app.current_request.headers or {}).get("authorization", "")
     if not auth.startswith("Bearer "):
         return None
     token = auth.replace("Bearer ", "", 1).strip()
     try:
         return decode_access_token(token)
-    except Exception:
+    except Exception as exc:
+        print(f"[auth] header access_token decode failed: {exc}", flush=True)
         return None
+
+
+def _payload_matches_user_token_version(payload: dict) -> bool:
+    # 與 user 紀錄上的 tokenVersion 比對；不一致代表 token 已被撤銷（例如 logout 後簽出的新版本）。
+    user = get_user_by_id(payload.get("sub"))
+    if not user:
+        return False
+    return int(user.get("tokenVersion") or 0) == int(payload.get("tokver") or 0)
+
+
+def _auth():
+    payload = _decode_access_payload()
+    if not payload:
+        return None
+    if not _payload_matches_user_token_version(payload):
+        print(f"[auth] tokver mismatch sub={payload.get('sub')!r}", flush=True)
+        return None
+    return payload
 
 
 def _require_auth():
@@ -199,15 +243,26 @@ def _require_admin_token():
 
 
 def _normalize_dynamo_numbers(item):
-    if not item:
-        return item
-    out = {}
-    for k, v in item.items():
-        if isinstance(v, Decimal):
-            out[k] = int(v) if v % 1 == 0 else float(v)
-        else:
-            out[k] = v
-    return out
+    """
+    遞迴將 DynamoDB 回傳的 Decimal 轉成 JSON 可序列化型別：
+      - 整數 Decimal → int
+      - 帶小數的 Decimal → str（例如金額 1.99，避免 float 浮點誤差導致對帳對不上）
+    呼叫端若需要做數值運算，應自己用 Decimal/int 解析字串。
+    """
+    if isinstance(item, Decimal):
+        try:
+            if item == item.to_integral_value():
+                return int(item)
+        except (InvalidOperation, ValueError):
+            pass
+        return str(item)
+    if isinstance(item, list):
+        return [_normalize_dynamo_numbers(v) for v in item]
+    if isinstance(item, tuple):
+        return tuple(_normalize_dynamo_numbers(v) for v in item)
+    if isinstance(item, dict):
+        return {k: _normalize_dynamo_numbers(v) for k, v in item.items()}
+    return item
 
 
 def _extract_linepay_order_response(body: dict) -> tuple[str | None, str | None]:
@@ -345,6 +400,27 @@ def _download_image(url: str) -> tuple[bytes, str | None]:
         content_type = resp.headers.get("Content-Type")
         body = resp.read()
     return body, content_type
+
+
+# LINE 圖文選單合法尺寸：全高 2500x1686、半高 2500x843
+_LINE_RICHMENU_SIZES = {(2500, 1686), (2500, 843)}
+
+def _scale_image_for_line(image_bytes: bytes, content_type: str | None, target: dict) -> tuple[bytes, str]:
+    target_w = int(target.get("width") or 2500)
+    target_h = int(target.get("height") or 1686)
+    # 若 target 不是 LINE 合法尺寸，強制對應到最近的合法尺寸
+    if (target_w, target_h) not in _LINE_RICHMENU_SIZES:
+        target_h = 843 if target_h <= 843 else 1686
+        target_w = 2500
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if img.size != (target_w, target_h):
+        img = img.resize((target_w, target_h), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    # PNG 轉 JPEG 避免超過 LINE 的 1MB 限制
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue(), "image/jpeg"
 
 
 def _line_headers(channel_access_token: str, content_type: str | None = "application/json") -> dict:
@@ -499,11 +575,42 @@ def _delete_line_richmenu_if_needed(item: dict, channel_access_token: str):
     )
 
 
+def _oa_channel_access_token(oa_item: dict) -> str:
+    oa_id = (oa_item.get("oaId") or "").strip()
+    return decrypt_secret(
+        oa_item.get("channelAccessTokenEnc") or "",
+        oa_id=oa_id,
+        field="channelAccessToken",
+    ).strip()
+
+
+def _oa_channel_secret(oa_item: dict) -> str:
+    oa_id = (oa_item.get("oaId") or "").strip()
+    return decrypt_secret(
+        oa_item.get("channelSecretEnc") or "",
+        oa_id=oa_id,
+        field="channelSecret",
+    ).strip()
+
+
 def _ensure_oa_access(oa_id: str, user_id: str):
     oa = oa_table.get_item(Key={"oaId": oa_id}).get("Item")
     if not oa or not _is_owner(oa, user_id):
         return None
     return oa
+
+
+def _query_richmenus_by_oa(oa_id: str):
+    # DynamoDB query 單次回傳上限 1MB，超過會切頁；用 LastEvaluatedKey 迴圈讀完避免漏資料。
+    kwargs = {"KeyConditionExpression": Key("oaId").eq(oa_id)}
+    while True:
+        resp = richmenu_table.query(**kwargs)
+        for item in resp.get("Items", []):
+            yield item
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
 
 
 def _ensure_richmenu_access(oa_id: str, richmenu_id: str, user_id: str):
@@ -547,6 +654,7 @@ def line_login():
             "avatarUrl": picture,
             "role": "editor",
             "status": "active",
+            "tokenVersion": 1,
             "createdAt": now,
             "updatedAt": now,
         }
@@ -570,10 +678,15 @@ def refresh():
         return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
     try:
         payload = decode_refresh_token(refresh_token)
-    except Exception:
+    except Exception as exc:
+        print(f"[auth] refresh_token decode failed: {exc}", flush=True)
         return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
     user = get_user_by_id(payload.get("sub"))
     if not user:
+        return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
+    # 即使 refresh token 還在 7 天有效期內，只要 tokenVersion 已被遞增（例如使用者已 logout），就視同已撤銷
+    if int(user.get("tokenVersion") or 0) != int(payload.get("tokver") or 0):
+        print(f"[auth] refresh tokver mismatch sub={payload.get('sub')!r}", flush=True)
         return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
     return _issue_auth_response(user)
 
@@ -591,6 +704,32 @@ def me():
 
 @app.route("/v1/auth/logout", methods=["POST"])
 def logout():
+    sub: str | None = None
+    payload = _auth()
+    if payload:
+        sub = payload.get("sub")
+    if not sub:
+        # access token 失效時改用 refresh token；但仍須通過 tokver 驗證以避免攻擊者用已撤銷的 token 觸發進一步 revoke
+        refresh_token_value = _get_all_cookies().get(REFRESH_COOKIE_NAME)
+        if refresh_token_value:
+            try:
+                rp = decode_refresh_token(refresh_token_value)
+                rp_user = get_user_by_id(rp.get("sub"))
+                if rp_user and int(rp_user.get("tokenVersion") or 0) == int(rp.get("tokver") or 0):
+                    sub = rp.get("sub")
+            except Exception as exc:
+                print(f"[auth] logout refresh_token decode failed: {exc}", flush=True)
+    if not sub:
+        return error("AUTH_UNAUTHORIZED", "unauthorized", 401)
+    # 遞增 tokenVersion 後，所有先前簽出的 access/refresh token 立刻失效（包含可能被竊的 7 天 refresh token）
+    try:
+        users_table.update_item(
+            Key={"userId": sub},
+            UpdateExpression="SET tokenVersion = if_not_exists(tokenVersion, :zero) + :one, updatedAt = :now",
+            ExpressionAttributeValues={":zero": 0, ":one": 1, ":now": now_iso()},
+        )
+    except ClientError as exc:
+        print(f"[auth] logout token revoke failed: {exc}", flush=True)
     return _response_with_cookies(
         body=success(),
         set_cookie_headers=[
@@ -646,16 +785,20 @@ def create_oa():
             picture_filename = upload_result["fileName"]
             picture_s3_key = upload_result["s3Key"]
             picture_url = upload_result["imageUrl"]
-        except Exception:
+        except Exception as exc:
             # Keep OA binding flow available even if avatar upload fails.
+            print(
+                f"[oa/avatar] download or upload failed (oa_id={oa_id}, source={picture_url}): {exc}",
+                flush=True,
+            )
             picture_filename = None
             picture_s3_key = None
     item = {
         "oaId": oa_id,
         "name": display_name,
         "accountId": basic_id,
-        "channelSecretEnc": channel_secret,
-        "channelAccessTokenEnc": channel_access_token,
+        "channelSecretEnc": encrypt_secret(channel_secret, oa_id=oa_id, field="channelSecret"),
+        "channelAccessTokenEnc": encrypt_secret(channel_access_token, oa_id=oa_id, field="channelAccessToken"),
         "pictureUrl": picture_url,
         "pictureFileName": picture_filename,
         "pictureS3Key": picture_s3_key,
@@ -693,8 +836,16 @@ def update_oa_token(oa_id):
     current = _ensure_oa_access(oa_id, user["sub"])
     if not current:
         return error("NOT_FOUND", "oa not found", 404)
-    current["channelSecretEnc"] = body.get("channelSecret", current.get("channelSecretEnc"))
-    current["channelAccessTokenEnc"] = body.get("channelAccessToken", current.get("channelAccessTokenEnc"))
+    new_channel_secret = body.get("channelSecret")
+    new_channel_access_token = body.get("channelAccessToken")
+    if new_channel_secret:
+        current["channelSecretEnc"] = encrypt_secret(
+            new_channel_secret, oa_id=oa_id, field="channelSecret"
+        )
+    if new_channel_access_token:
+        current["channelAccessTokenEnc"] = encrypt_secret(
+            new_channel_access_token, oa_id=oa_id, field="channelAccessToken"
+        )
     current["tokenVersion"] = int(current.get("tokenVersion", 0)) + 1
     current["updatedBy"] = user["sub"]
     current["updatedAt"] = now_iso()
@@ -729,7 +880,7 @@ def get_richmenus():
     if not _ensure_oa_access(oa_id, user["sub"]):
         return error("NOT_FOUND", "oa not found", 404)
     items = [_enrich_richmenu_image(i) for i in list_richmenus(oa_id, user["sub"], search)]
-    return {"data": items, "paging": {"nextCursor": None}}
+    return {"data": items}
 
 
 @app.route("/v1/richmenus", methods=["POST"])
@@ -753,11 +904,14 @@ def create_richmenu():
     image_size = None
     image_base64 = body.get("imageBase64")
     if image_base64:
-        upload_result = upload_richmenu_image_base64(
-            oa_id=oa_id,
-            image_base64=image_base64,
-            mime_type=body.get("imageMimeType"),
-        )
+        try:
+            upload_result = upload_richmenu_image_base64(
+                oa_id=oa_id,
+                image_base64=image_base64,
+                mime_type=body.get("imageMimeType"),
+            )
+        except InvalidImageError as exc:
+            return error("VALIDATION_ERROR", str(exc), 400)
         image_url = upload_result["imageUrl"]
         image_file_id = upload_result["fileId"]
         image_s3_key = upload_result["s3Key"]
@@ -828,11 +982,14 @@ def update_richmenu(richmenu_id):
         if key in body:
             item[key] = body[key]
     if body.get("imageBase64"):
-        upload_result = upload_richmenu_image_base64(
-            oa_id=oa_id,
-            image_base64=body["imageBase64"],
-            mime_type=body.get("imageMimeType"),
-        )
+        try:
+            upload_result = upload_richmenu_image_base64(
+                oa_id=oa_id,
+                image_base64=body["imageBase64"],
+                mime_type=body.get("imageMimeType"),
+            )
+        except InvalidImageError as exc:
+            return error("VALIDATION_ERROR", str(exc), 400)
         item["imageUrl"] = upload_result["imageUrl"]
         item["imageFileId"] = upload_result["fileId"]
         item["imageS3Key"] = upload_result["s3Key"]
@@ -855,15 +1012,13 @@ def delete_richmenu(richmenu_id):
     oa_id = (app.current_request.query_params or {}).get("oaId")
     if not oa_id:
         return error("VALIDATION_ERROR", "oaId is required", 400)
-    if not _ensure_oa_access(oa_id, user["sub"]):
-        return error("NOT_FOUND", "oa not found", 404)
     oa_item = _ensure_oa_access(oa_id, user["sub"])
     if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
     item = _ensure_richmenu_access(oa_id, richmenu_id, user["sub"])
     if not item:
         return error("NOT_FOUND", "richmenu not found", 404)
-    channel_access_token = (oa_item.get("channelAccessTokenEnc") or "").strip()
+    channel_access_token = _oa_channel_access_token(oa_item)
     if item.get("lineRichMenuId") and not channel_access_token:
         return error("VALIDATION_ERROR", "channelAccessToken is required", 400)
     if item.get("lineRichMenuId"):
@@ -891,7 +1046,7 @@ def publish_richmenu(richmenu_id):
     item = _ensure_richmenu_access(oa_id, richmenu_id, user["sub"])
     if not item:
         return error("NOT_FOUND", "richmenu not found", 404)
-    channel_access_token = (oa_item.get("channelAccessTokenEnc") or "").strip()
+    channel_access_token = _oa_channel_access_token(oa_item)
     if not channel_access_token:
         return error("VALIDATION_ERROR", "channelAccessToken is required", 400)
     image_url = get_richmenu_image_url(item.get("imageS3Key"), item.get("imageUrl"))
@@ -906,6 +1061,24 @@ def publish_richmenu(richmenu_id):
         test_publish_without_payment = normalized in {"true", "1", "yes", "y"}
     else:
         test_publish_without_payment = bool(raw_test_publish_without_payment)
+
+    if test_publish_without_payment:
+        # production 一律禁止任何免付費發佈旗標，避免帳號被盜後變成永久繞過付款的後門
+        if _is_prod_stage():
+            return error(
+                "PERMISSION_DENIED",
+                "testPublishWithoutPayment is not allowed in production",
+                403,
+            )
+        # 非 prod stage 仍須限縮在 DEBUG_ACCESS_TOKEN_EMAIL 帳號
+        requester = get_user_by_id(user["sub"]) or {}
+        requester_email = (requester.get("email") or "").strip().lower()
+        if not DEBUG_ACCESS_TOKEN_EMAIL or requester_email != DEBUG_ACCESS_TOKEN_EMAIL:
+            return error(
+                "PERMISSION_DENIED",
+                "testPublishWithoutPayment is restricted to the debug account",
+                403,
+            )
 
     if not test_publish_without_payment:
         try:
@@ -988,7 +1161,8 @@ def publish_richmenu(richmenu_id):
         )
 
         image_bytes, image_content_type = _download_image(image_url)
-        upload_content_type = image_content_type or item.get("imageMimeType") or "image/png"
+        richmenu_size = item.get("size") or {"width": 2500, "height": 1686}
+        image_bytes, upload_content_type = _scale_image_for_line(image_bytes, image_content_type, richmenu_size)
         _, upload_req_id = _line_request(
             method="POST",
             url=f"https://api-data.line.me/v2/bot/richmenu/{line_richmenu_id}/content",
@@ -1114,7 +1288,7 @@ def unlink_default():
     oa_item = _ensure_oa_access(oa_id, user["sub"])
     if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
-    channel_access_token = (oa_item.get("channelAccessTokenEnc") or "").strip()
+    channel_access_token = _oa_channel_access_token(oa_item)
     if not channel_access_token:
         return error("VALIDATION_ERROR", "channelAccessToken is required", 400)
 
@@ -1128,14 +1302,17 @@ def unlink_default():
     except ValueError as exc:
         return error("LINE_API_ERROR", str(exc), 400)
 
-    resp = richmenu_table.query(KeyConditionExpression=Key("oaId").eq(oa_id))
-    for item in resp.get("Items", []):
+    items_to_update = []
+    for item in _query_richmenus_by_oa(oa_id):
         if not _is_owner(item, user["sub"]):
             continue
         if item.get("isDefault"):
             item["isDefault"] = False
             item["updatedAt"] = now_iso()
-            richmenu_table.put_item(Item=item)
+            items_to_update.append(item)
+    with richmenu_table.batch_writer() as batch:
+        for item in items_to_update:
+            batch.put_item(Item=item)
     return success({"oaId": oa_id, "defaultRichMenuId": None})
 
 
@@ -1150,9 +1327,8 @@ def close_all():
         return error("VALIDATION_ERROR", "oaId is required", 400)
     if not _ensure_oa_access(oa_id, user["sub"]):
         return error("NOT_FOUND", "oa not found", 404)
-    resp = richmenu_table.query(KeyConditionExpression=Key("oaId").eq(oa_id))
-    count = 0
-    for item in resp.get("Items", []):
+    items_to_update = []
+    for item in _query_richmenus_by_oa(oa_id):
         if not _is_owner(item, user["sub"]):
             continue
         if item.get("status") != "draft":
@@ -1160,9 +1336,11 @@ def close_all():
             item["isDefault"] = False
             item["updatedAt"] = now_iso()
             item["statusUpdatedAt"] = f"draft#{item['updatedAt']}"
-            richmenu_table.put_item(Item=item)
-            count += 1
-    return success({"oaId": oa_id, "closedCount": count})
+            items_to_update.append(item)
+    with richmenu_table.batch_writer() as batch:
+        for item in items_to_update:
+            batch.put_item(Item=item)
+    return success({"oaId": oa_id, "closedCount": len(items_to_update)})
 
 
 @app.route("/v1/richmenus/bulk-delete", methods=["POST"])
@@ -1181,11 +1359,11 @@ def bulk_delete_richmenus():
     oa_item = _ensure_oa_access(oa_id, user["sub"])
     if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
-    channel_access_token = (oa_item.get("channelAccessTokenEnc") or "").strip()
+    channel_access_token = _oa_channel_access_token(oa_item)
 
-    removed_count = 0
     removed_ids = []
     failed_items = []
+    items_to_update = []
 
     # Remove duplicated ids to avoid repeated delete calls.
     unique_ids = list(dict.fromkeys([str(x).strip() for x in richmenu_ids if str(x).strip()]))
@@ -1209,17 +1387,20 @@ def bulk_delete_richmenus():
             item["updatedAt"] = now_iso()
             item["updatedBy"] = user["sub"]
             item["statusUpdatedAt"] = f"draft#{item['updatedAt']}"
-            richmenu_table.put_item(Item=item)
-            removed_count += 1
+            items_to_update.append(item)
             removed_ids.append(richmenu_id)
             continue
         # Not published to LINE before; keep DB item unchanged and return as skipped.
         failed_items.append({"id": richmenu_id, "reason": "NOT_PUBLISHED_TO_LINE"})
 
+    with richmenu_table.batch_writer() as batch:
+        for item in items_to_update:
+            batch.put_item(Item=item)
+
     return success(
         {
             "oaId": oa_id,
-            "removedCount": removed_count,
+            "removedCount": len(items_to_update),
             "removedIds": removed_ids,
             "failedCount": len(failed_items),
             "failedItems": failed_items,
@@ -1243,7 +1424,7 @@ def remove_all_line_richmenus():
     if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
 
-    channel_access_token = (oa_item.get("channelAccessTokenEnc") or "").strip()
+    channel_access_token = _oa_channel_access_token(oa_item)
     if not channel_access_token:
         return error("VALIDATION_ERROR", "channel access token is required", 400)
 
@@ -1302,13 +1483,47 @@ def delete_all_richmenus():
     oa_id = (app.current_request.query_params or {}).get("oaId")
     if not oa_id:
         return error("VALIDATION_ERROR", "oaId is required", 400)
-    if not _ensure_oa_access(oa_id, user["sub"]):
+    oa_item = _ensure_oa_access(oa_id, user["sub"])
+    if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
-    resp = richmenu_table.query(KeyConditionExpression=Key("oaId").eq(oa_id))
-    items = [item for item in resp.get("Items", []) if _is_owner(item, user["sub"])]
+    items = [item for item in _query_richmenus_by_oa(oa_id) if _is_owner(item, user["sub"])]
+
+    # 與 bulk_delete 一致：任何已綁 LINE Rich Menu 的項目都必須先打 LINE API 刪除，
+    # 不能只刪 DB 而留下殘存資源在 LINE 端。
+    channel_access_token = _oa_channel_access_token(oa_item)
+    requires_token = any(i.get("lineRichMenuId") for i in items)
+    if requires_token and not channel_access_token:
+        return error("VALIDATION_ERROR", "channelAccessToken is required", 400)
+
+    deleted_ids: list[str] = []
+    failed_items: list[dict] = []
+    keys_to_delete: list[dict] = []
     for item in items:
-        richmenu_table.delete_item(Key={"oaId": oa_id, "richMenuId": item["richMenuId"]})
-    return success({"oaId": oa_id, "deletedCount": len(items)})
+        rm_id = item["richMenuId"]
+        if item.get("lineRichMenuId"):
+            try:
+                _delete_line_richmenu_if_needed(item, channel_access_token)
+            except ValueError as exc:
+                failed_items.append(
+                    {"id": rm_id, "reason": "LINE_API_ERROR", "message": str(exc)}
+                )
+                continue
+        keys_to_delete.append({"oaId": oa_id, "richMenuId": rm_id})
+        deleted_ids.append(rm_id)
+
+    with richmenu_table.batch_writer() as batch:
+        for key in keys_to_delete:
+            batch.delete_item(Key=key)
+
+    return success(
+        {
+            "oaId": oa_id,
+            "deletedCount": len(keys_to_delete),
+            "deletedIds": deleted_ids,
+            "failedCount": len(failed_items),
+            "failedItems": failed_items,
+        }
+    )
 
 
 @app.route("/v1/files/richmenu-image", methods=["POST"])
@@ -1324,11 +1539,14 @@ def upload_image():
         return error("VALIDATION_ERROR", "oaId and imageBase64 are required", 400)
     if not _ensure_oa_access(oa_id, user["sub"]):
         return error("NOT_FOUND", "oa not found", 404)
-    upload_result = upload_richmenu_image_base64(
-        oa_id=oa_id,
-        image_base64=image_base64,
-        mime_type=body.get("imageMimeType"),
-    )
+    try:
+        upload_result = upload_richmenu_image_base64(
+            oa_id=oa_id,
+            image_base64=image_base64,
+            mime_type=body.get("imageMimeType"),
+        )
+    except InvalidImageError as exc:
+        return error("VALIDATION_ERROR", str(exc), 400)
     return {"data": upload_result}
 
 
@@ -1386,7 +1604,14 @@ def _compute_plan_end_at(paid_at_iso: str, billing_cycle: str | None) -> str | N
     if not paid_dt:
         return None
     cycle = (billing_cycle or "monthly").strip().lower()
-    add_days = 365 if cycle == "yearly" else 31
+    if cycle in ("yearly", "12months"):
+        add_days = 365
+    elif cycle == "6months":
+        add_days = 183
+    elif cycle == "3months":
+        add_days = 92
+    else:
+        add_days = 31
     end_date = (paid_dt + timedelta(days=add_days)).date() + timedelta(days=1)
     end_dt = datetime(
         year=end_date.year,
@@ -1541,7 +1766,7 @@ def admin_cleanup_expired_richmenus():
         if not _is_plan_cleanup_due(plan_end_at, grace_days=grace_days):
             continue
 
-        channel_access_token = (oa.get("channelAccessTokenEnc") or "").strip()
+        channel_access_token = _oa_channel_access_token(oa)
         if not channel_access_token:
             failed_details.append({"oaId": oa_id, "reason": "Missing channelAccessToken"})
             continue
@@ -1555,18 +1780,10 @@ def admin_cleanup_expired_richmenus():
         # ==========================================
         try:
             # [步驟 A] 撈取該 OA 擁有的所有圖文選單 (處理 DynamoDB Query 分頁)
-            query_kwargs = {"KeyConditionExpression": Key("oaId").eq(oa_id)}
-            oa_richmenus = []
-            while True:
-                rm_resp = richmenu_table.query(**query_kwargs)
-                oa_richmenus.extend(rm_resp.get("Items", []))
-                
-                rm_last_key = rm_resp.get("LastEvaluatedKey")
-                if not rm_last_key:
-                    break
-                query_kwargs["ExclusiveStartKey"] = rm_last_key
+            oa_richmenus = list(_query_richmenus_by_oa(oa_id))
 
             # [步驟 B] 針對資料庫內有紀錄的選單，逐一刪除 LINE 端實體與 Alias
+            rms_to_update = []
             for rm in oa_richmenus:
                 line_richmenu_id = (rm.get("lineRichMenuId") or "").strip()
                 richmenu_id = (rm.get("richMenuId") or "").strip()
@@ -1585,8 +1802,12 @@ def admin_cleanup_expired_richmenus():
                             content_type=None,
                         )
                         removed_alias_ids.append(richmenu_id)
-                    except Exception:
-                        pass # 容錯：Alias 可能已不存在
+                    except Exception as exc:
+                        # 容錯：Alias 可能已不存在；保留流程但記錄訊息以便追查
+                        print(
+                            f"[cleanup/alias] delete failed (oa_id={oa_id}, richmenu_id={richmenu_id}): {exc}",
+                            flush=True,
+                        )
 
                 # 2. 刪除 LINE 端的圖文選單實體
                 is_line_deleted = False
@@ -1621,7 +1842,12 @@ def admin_cleanup_expired_richmenus():
                     rm["lineRichMenuId"] = None
                     rm["updatedAt"] = now
                     rm["statusUpdatedAt"] = f"draft#{now}"
-                    richmenu_table.put_item(Item=rm)
+                    rms_to_update.append(rm)
+
+            # [步驟 D] 累積所有「LINE 端確認刪除」的選單後一次批次寫回，降低 DynamoDB 呼叫次數
+            with richmenu_table.batch_writer() as batch:
+                for rm in rms_to_update:
+                    batch.put_item(Item=rm)
 
             cleanup_due_at = _get_plan_cleanup_due_at(plan_end_at, grace_days=grace_days)
             processed_details.append(
@@ -1659,6 +1885,37 @@ def admin_cleanup_expired_richmenus():
     )
 
 
+def _get_idempotency_key() -> str:
+    headers = app.current_request.headers or {}
+    raw = (
+        headers.get("idempotency-key")
+        or headers.get("Idempotency-Key")
+        or headers.get("IDEMPOTENCY-KEY")
+        or ""
+    )
+    return str(raw).strip()
+
+
+def _find_payment_order_by_idempotency(user_id: str, key: str) -> dict | None:
+    if not key:
+        return None
+    try:
+        # 取最近 50 筆已建立訂單做比對；同一個用戶在這視窗內重複用同一把 key 視為同一筆
+        resp = payment_order_table.query(
+            IndexName="gsi_user_created",
+            KeyConditionExpression=Key("userId").eq(user_id),
+            ScanIndexForward=False,
+            Limit=50,
+        )
+    except ClientError as exc:
+        _payment_log(f"idempotency lookup failed: {exc!r}")
+        return None
+    for raw in resp.get("Items", []) or []:
+        if (raw.get("idempotencyKey") or "") == key:
+            return raw
+    return None
+
+
 @app.route("/v1/payments/orders", methods=["POST"])
 def create_payment_order():
     _payment_log("=== POST /v1/payments/orders 開始 ===")
@@ -1675,14 +1932,59 @@ def create_payment_order():
     oa_item = _ensure_oa_access(oa_id, user["sub"])
     if not oa_item:
         return error("NOT_FOUND", "oa not found", 404)
+
+    # Idempotency-Key 由前端在按下「付款」時隨機產生並重複送同一把；命中即回上次結果，避免重複建單。
+    idempotency_key = _get_idempotency_key()
+    if idempotency_key:
+        existing = _find_payment_order_by_idempotency(user["sub"], idempotency_key)
+        if existing and (existing.get("oaId") or "") == oa_id:
+            _payment_log(
+                f"idempotency hit: key={idempotency_key!r} -> orderId={existing.get('orderId')!r}"
+            )
+            return {
+                "data": {
+                    "orderId": existing.get("orderId"),
+                    "paymentUrl": existing.get("paymentUrl"),
+                    "idempotent": True,
+                }
+            }
+
     billing_cycle = str(body.get("billingCycle") or body.get("cycle") or "monthly").strip() or "monthly"
     _payment_log(
         f"步驟 1: 認證通過 userId={user['sub']!r}, oaId={oa_id!r}, billingCycle={billing_cycle!r}"
     )
-    _payment_log("步驟 2: 呼叫 chalicelib.linepay.post_linepay_order()（requests 寫死 payload / key）")
+    # 各方案標準金額（單位：TWD）；env 可覆寫以便測試
+    cycle_lower = billing_cycle.lower()
+    if cycle_lower in ("yearly", "12months"):
+        amount_env = os.environ.get("LINEPAY_AMOUNT_YEARLY") or os.environ.get("LINEPAY_AMOUNT_12MONTHS")
+        default_amount = 1790
+    elif cycle_lower == "6months":
+        amount_env = os.environ.get("LINEPAY_AMOUNT_6MONTHS")
+        default_amount = 999
+    elif cycle_lower == "3months":
+        amount_env = os.environ.get("LINEPAY_AMOUNT_3MONTHS")
+        default_amount = 549
+    else:
+        amount_env = os.environ.get("LINEPAY_AMOUNT_MONTHLY")
+        default_amount = 199
+    try:
+        order_amount = int((amount_env or str(default_amount)).strip())
+    except ValueError:
+        return error(
+            "CONFIG_ERROR",
+            "LINEPAY_AMOUNT_* must be a positive integer",
+            500,
+        )
+    if order_amount <= 0:
+        return error(
+            "CONFIG_ERROR",
+            "LINEPAY_AMOUNT_* must be a positive integer",
+            500,
+        )
+    _payment_log(f"步驟 2: 呼叫 chalicelib.linepay.post_linepay_order(amount={order_amount})")
 
     try:
-        resp_body = post_linepay_order()
+        resp_body = post_linepay_order(amount=order_amount)
     except ValueError as exc:
         msg = str(exc)
         _payment_log(f"步驟 3: 金流呼叫失敗 ValueError: {msg}")
@@ -1708,7 +2010,6 @@ def create_payment_order():
 
     linepay_status = resp_body.get("status") if isinstance(resp_body, dict) else None
     product_name_display = "圖文選單費用"
-    amount = 1
 
     now = now_iso()
     item = {
@@ -1718,7 +2019,7 @@ def create_payment_order():
         "productName": product_name_display,
         "planName": "pro",
         "billingCycle": billing_cycle,
-        "amount": amount,
+        "amount": order_amount,
         "currency": "TWD",
         "status": "pending",
         "paymentUrl": payment_url,
@@ -1726,6 +2027,8 @@ def create_payment_order():
         "createdAt": now,
         "updatedAt": now,
     }
+    if idempotency_key:
+        item["idempotencyKey"] = idempotency_key
     table_name = os.environ.get("PAYMENT_ORDER_TABLE", "line_payment_order")
     _payment_log(
         f"步驟 13: 寫入 DynamoDB table={table_name!r}, orderId={order_id!r}, userId={user['sub']!r}, oaId={oa_id!r}"
@@ -1800,22 +2103,119 @@ def check_payment():
     return {"data": validity}
 
 
-@app.route("/v1/payments/callback", methods=["GET"])
-def payment_callback():
-    qp = app.current_request.query_params or {}
-    order_id = (qp.get("order_id") or "").strip()
-    ts = (qp.get("ts") or "").strip()
-    sig = (qp.get("sig") or "").strip()
+PAYMENT_CALLBACK_TS_SKEW_SECONDS = 5 * 60
 
-    if not order_id or not ts or not sig:
-        return error("INVALID_CALLBACK", "Missing required parameters", 400)
+
+@app.route("/v1/payments/callback", methods=["GET", "POST"])
+def payment_callback():
+    # GET: payment service 的簡易 callback（query params: order_id, ts, sig）
+    if app.current_request.method == "GET":
+        params = app.current_request.query_params or {}
+        order_id = (params.get("order_id") or "").strip()
+        ts = (params.get("ts") or "").strip()
+        sig = (params.get("sig") or "").strip()
+        if not order_id or not ts or not sig:
+            return error("INVALID_CALLBACK", "order_id, ts, sig are required", 400)
+        try:
+            ts_int = int(ts)
+        except ValueError:
+            return error("INVALID_CALLBACK", "ts must be an integer epoch second", 400)
+        now_epoch = int(time.time())
+        if abs(now_epoch - ts_int) > PAYMENT_CALLBACK_TS_SKEW_SECONDS:
+            return error("INVALID_CALLBACK", "timestamp is outside the allowed window", 400)
+        company_key = (os.environ.get("LINEPAY_COMPANY_KEY") or "").strip()
+        hash_key = (os.environ.get("LINEPAY_HASH_KEY") or "").strip()
+        if not company_key or not hash_key:
+            return error("CONFIG_ERROR", "LINEPAY_COMPANY_KEY and LINEPAY_HASH_KEY must be configured", 500)
+        if not verify_simple_payment_callback(company_key, hash_key, order_id=order_id, ts=ts, sig=sig):
+            return error("INVALID_SIGNATURE", "Signature verification failed", 401)
+        resp = payment_order_table.get_item(Key={"orderId": order_id})
+        order = resp.get("Item")
+        if not order:
+            return error("ORDER_NOT_FOUND", "Order does not exist", 404)
+        billing_cycle = order.get("billingCycle") or order.get("billing_cycle") or "monthly"
+        paid_at_iso = now_iso()
+        plan_end_at = _compute_plan_end_at(paid_at_iso, billing_cycle)
+        if not plan_end_at:
+            return error("INVALID_BILLING_CYCLE", "Cannot compute plan end", 400)
+        try:
+            payment_order_table.update_item(
+                Key={"orderId": order_id},
+                UpdateExpression=(
+                    "SET #status = :paid, paidAt = :paid_at, planStartAt = :plan_start, "
+                    "planEndAt = :plan_end, updatedAt = :updated_at"
+                ),
+                ConditionExpression="#status = :pending",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":paid": "paid",
+                    ":pending": "pending",
+                    ":paid_at": paid_at_iso,
+                    ":plan_start": paid_at_iso,
+                    ":plan_end": plan_end_at,
+                    ":updated_at": now_iso(),
+                },
+            )
+        except ClientError as exc:
+            code = (exc.response.get("Error") or {}).get("Code")
+            if code == "ConditionalCheckFailedException":
+                return error("ORDER_ALREADY_PROCESSED", "Order is not in pending state", 409)
+            err = exc.response.get("Error") or {}
+            return error("DATABASE_ERROR", f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}", 503)
+        return Response(status_code=200, body="OK", headers={"Content-Type": "text/plain; charset=utf-8"})
+
+    # POST: 改為 POST + body 簽章；簽章包含 amount/status/ts，並驗證 ts 漂移與訂單目前狀態，避免 GET URL 被重放。
+    body = _json()
+    order_id = (str(body.get("order_id") or "")).strip()
+    ts = (str(body.get("ts") or "")).strip()
+    sig = (str(body.get("sig") or "")).strip()
+    callback_status = (str(body.get("status") or "")).strip().lower()
+    raw_amount = body.get("amount")
+
+    if not order_id or not ts or not sig or not callback_status or raw_amount is None:
+        return error(
+            "INVALID_CALLBACK",
+            "order_id, ts, sig, status, amount are required",
+            400,
+        )
+
+    try:
+        callback_amount = int(raw_amount)
+    except (TypeError, ValueError):
+        return error("INVALID_CALLBACK", "amount must be an integer", 400)
+    if callback_amount <= 0:
+        return error("INVALID_CALLBACK", "amount must be positive", 400)
+
+    if callback_status not in {"paid", "success"}:
+        # 僅接受成功狀態；其他（如 cancelled）走 callback 不應翻訂單為 paid
+        return error("INVALID_CALLBACK", f"unsupported status: {callback_status}", 400)
+
+    try:
+        ts_int = int(ts)
+    except ValueError:
+        return error("INVALID_CALLBACK", "ts must be an integer epoch second", 400)
+    now_epoch = int(time.time())
+    if abs(now_epoch - ts_int) > PAYMENT_CALLBACK_TS_SKEW_SECONDS:
+        return error(
+            "INVALID_CALLBACK",
+            "timestamp is outside the allowed window",
+            400,
+        )
 
     company_key = (os.environ.get("LINEPAY_COMPANY_KEY") or "").strip()
     hash_key = (os.environ.get("LINEPAY_HASH_KEY") or "").strip()
     if not company_key or not hash_key:
         return error("CONFIG_ERROR", "LINEPAY_COMPANY_KEY and LINEPAY_HASH_KEY must be configured", 500)
 
-    if not verify_payment_callback(company_key, hash_key, order_id, ts, sig):
+    if not verify_payment_callback(
+        company_key,
+        hash_key,
+        order_id=order_id,
+        ts=ts,
+        amount=str(callback_amount),
+        status=callback_status,
+        sig=sig,
+    ):
         return error("INVALID_SIGNATURE", "Signature verification failed", 401)
 
     resp = payment_order_table.get_item(Key={"orderId": order_id})
@@ -1823,24 +2223,58 @@ def payment_callback():
     if not order:
         return error("ORDER_NOT_FOUND", "Order does not exist", 404)
 
+    # 比對 callback 帶來的金額與訂單實際金額是否一致
+    try:
+        stored_amount = int(order.get("amount") or 0)
+    except (TypeError, ValueError):
+        return error("INVALID_AMOUNT", "Invalid stored amount on order", 500)
+    if stored_amount != callback_amount:
+        _payment_log(
+            f"callback amount mismatch order_id={order_id!r} stored={stored_amount} got={callback_amount}"
+        )
+        return error("INVALID_AMOUNT", "Amount does not match order", 400)
+
     billing_cycle = order.get("billingCycle") or order.get("billing_cycle") or "monthly"
-    paid_at_iso = order.get("paidAt") or order.get("paid_at") or ""
-
-    if order.get("status") != "paid":
-        paid_at_iso = now_iso()
-
+    paid_at_iso = now_iso()
     plan_start_at = paid_at_iso
     plan_end_at = _compute_plan_end_at(paid_at_iso, billing_cycle)
+    if not plan_end_at:
+        return error("INVALID_BILLING_CYCLE", "Cannot compute plan end", 400)
 
-    should_update = order.get("status") != "paid" or not order.get("planStartAt") or not order.get("planEndAt")
-    if should_update and paid_at_iso and plan_end_at:
-        updated = dict(order)
-        updated["status"] = "paid"
-        updated["paidAt"] = paid_at_iso
-        updated["planStartAt"] = plan_start_at
-        updated["planEndAt"] = plan_end_at
-        updated["updatedAt"] = now_iso()
-        payment_order_table.put_item(Item=updated)
+    # 條件式更新：只允許 status=pending 才能翻成 paid，避免任何 callback 被重放讓已 paid 訂單再次延長期限
+    try:
+        payment_order_table.update_item(
+            Key={"orderId": order_id},
+            UpdateExpression=(
+                "SET #status = :paid, paidAt = :paid_at, planStartAt = :plan_start, "
+                "planEndAt = :plan_end, updatedAt = :updated_at"
+            ),
+            ConditionExpression="#status = :pending",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":paid": "paid",
+                ":pending": "pending",
+                ":paid_at": paid_at_iso,
+                ":plan_start": plan_start_at,
+                ":plan_end": plan_end_at,
+                ":updated_at": now_iso(),
+            },
+        )
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code")
+        if code == "ConditionalCheckFailedException":
+            # 訂單已不在 pending 狀態（已付過或已取消），拒絕重放
+            return error(
+                "ORDER_ALREADY_PROCESSED",
+                "Order is not in pending state",
+                409,
+            )
+        err = exc.response.get("Error") or {}
+        return error(
+            "DATABASE_ERROR",
+            f"{err.get('Code', 'ClientError')}: {err.get('Message', str(exc))}",
+            503,
+        )
 
     return Response(status_code=200, body="OK", headers={"Content-Type": "text/plain; charset=utf-8"})
 
